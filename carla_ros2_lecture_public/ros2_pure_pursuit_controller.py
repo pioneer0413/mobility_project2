@@ -27,7 +27,6 @@ class PurePursuitFromGNSS(Node):
         self.lat0 = None
         self.lon0 = None
         self.cos_lat0 = 1.0
-
         # 상태 변수
         self.curr_xy: Optional[Tuple[float, float]] = None
         self.prev_xy: Optional[Tuple[float, float]] = None
@@ -40,7 +39,7 @@ class PurePursuitFromGNSS(Node):
         # 제어 파라미터
         self.lookahead = 6.0
         self.wheel_base = 2.7
-        self.target_speed = 5.0  # m/s
+        self.target_speed = 3.0  # m/s
         
         # ⭐ 목적지 도달 파라미터
         self.goal_threshold = 2.0      # 정지 거리 (m)
@@ -49,7 +48,7 @@ class PurePursuitFromGNSS(Node):
         self.is_goal_reached = False
 
         # ⭐ Global Path 로드 (Local Planner와 동일)
-        self._load_global_path("global_path.csv")
+        self._load_global_path("/home/itec/carla/PythonAPI/examples/ros2/mobility_project2/path/global_path_1.csv")
         if not self.global_xy:
             self.get_logger().warn("global_path.csv is empty or not found.")
         elif len(self.global_xy) > 0:

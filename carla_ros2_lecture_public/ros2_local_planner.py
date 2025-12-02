@@ -34,7 +34,7 @@ class LocalPathAvoid(Node):
         self.safe_lat = 2.0
         self.max_offset = 3.0
 
-        self._load_global_path("global_path.csv")
+        self._load_global_path("/home/itec/carla/PythonAPI/examples/ros2/mobility_project2/path/global_path_1.csv")
         if not self.global_xy:
             self.get_logger().warn("global_path.csv is empty or not found.")
 
