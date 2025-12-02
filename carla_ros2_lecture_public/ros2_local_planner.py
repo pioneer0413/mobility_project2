@@ -8,9 +8,11 @@ from sensor_msgs.msg import NavSatFix
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseArray, PoseStamped
 
+import argparse
+
 
 class LocalPathAvoid(Node):
-    def __init__(self):
+    def __init__(self, path_num: int = 1):
         super().__init__("local_path_avoid")
 
         self.sub_gnss = self.create_subscription(
@@ -34,7 +36,7 @@ class LocalPathAvoid(Node):
         self.safe_lat = 2.0
         self.max_offset = 3.0
 
-        self._load_global_path("/home/itec/carla/PythonAPI/examples/ros2/mobility_project2/path/global_path_1.csv")
+        self._load_global_path(f"../path/global_path_{path_num}.csv")
         if not self.global_xy:
             self.get_logger().warn("global_path.csv is empty or not found.")
 
@@ -102,18 +104,30 @@ class LocalPathAvoid(Node):
         s = 0.0
         prev_px, prev_py = x, y
         i = idx
+        
         while i < len(self.global_xy) and s <= self.L:
             gx, gy = self.global_xy[i]
-
             seg = math.hypot(gx - prev_px, gy - prev_py)
             s += seg
             prev_px, prev_py = gx, gy
 
             px, py = gx, gy
+            
             if side != 0:
-                offset = self.max_offset * math.sin(math.pi * min(s, self.L) / self.L)
-                nx = -math.sin(yaw)
-                ny = math.cos(yaw)
+                # ⭐ 각 점마다 로컬 방향 계산
+                if i + 1 < len(self.global_xy):
+                    x_next, y_next = self.global_xy[i + 1]
+                    local_yaw = math.atan2(y_next - gy, x_next - gx)
+                else:
+                    local_yaw = yaw
+            
+                # ⭐ 부드러운 offset (3차 함수)
+                t = min(s / self.L, 1.0)
+                smooth_t = 3 * t**2 - 2 * t**3
+                offset = self.max_offset * smooth_t * (1.0 - smooth_t) * 4
+                
+                nx = -math.sin(local_yaw)
+                ny = math.cos(local_yaw)
                 px += offset * side * nx
                 py += offset * side * ny
 
@@ -123,7 +137,6 @@ class LocalPathAvoid(Node):
             ps.pose.position.y = float(py)
             ps.pose.position.z = 0.0
             path.poses.append(ps)
-
             i += 1
 
         self.pub_local.publish(path)
@@ -164,9 +177,9 @@ class LocalPathAvoid(Node):
         return +1 if y_local < 0.0 else -1  # obstacle right -> go left
 
 
-def main(args=None):
+def main(args=None, path_num: int = 1):
     rclpy.init(args=args)
-    node = LocalPathAvoid()
+    node = LocalPathAvoid(path_num=path_num)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -176,4 +189,7 @@ def main(args=None):
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--path_num', type=int, default=1, choices=[1,2,3,4], help='Global path number to use (e.g., 1 or 2)')
+    args = parser.parse_args()
+    main(path_num=args.path_num)
