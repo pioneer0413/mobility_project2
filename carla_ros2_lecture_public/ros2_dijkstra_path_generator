@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import sys
 import os
 import glob
@@ -48,10 +49,14 @@ class DijkstraPathGenerator(Node):
             return
 
         spawn_points = self.map.get_spawn_points()
-        
-        # [설정] 시작점과 도착점
+
+        # [설정] 
+        # 시작점 
         self.start_tf = spawn_points[0]
+
+        # 도착점
         # 가까운 거리 테스트: 50, 150 등
+        # 테스트 어려운 곳 추천 값 62,190 등
         self.goal_tf = spawn_points[151] 
 
         self.get_logger().info(f"Start (Abs): ({self.start_tf.location.x:.2f}, {self.start_tf.location.y:.2f})")
