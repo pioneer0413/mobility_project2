@@ -17,7 +17,10 @@ class LocalPathAvoid(Node):
                  L: float=20.0, 
                  ds: float=0.5, 
                  safe_lat: float=1.0, 
-                 max_offset: float=3.5):
+                 max_offset: float=3.5,
+                 num_lattices: int=7,
+                 lateral_offsets: List[float]=[-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0],
+                 planner: str='lattice'):
         super().__init__("local_path_avoid")
 
         self.sub_gnss = self.create_subscription(
@@ -43,7 +46,13 @@ class LocalPathAvoid(Node):
 
         self.prev_idx: Optional[int] = None  # ★ 전역 경로 최근접 인덱스 캐시
 
-        self.load_global_path(f"../path/global_path_{path_num}.csv")  # 네가 쓰는 파일명으로 맞춰라
+        # Lattice 파라미터
+        self.num_lattices = num_lattices  # 후보 경로 개수
+        self.lateral_offsets = lateral_offsets  # offset 후보
+
+        self.planner = planner # 플래너 종류
+    
+        self._load_global_path(f"../path/global_path_{path_num}.csv")  # 네가 쓰는 파일명으로 맞춰라
         if not self.global_xy:
             self.get_logger().warn("global path is empty or not found.")
 
@@ -96,68 +105,207 @@ class LocalPathAvoid(Node):
 
         x, y = self.current_xy
 
-        # ① 전역 경로에서 현재 위치와 가장 가까운 인덱스
-        idx = self._find_nearest_index(x, y, self.global_xy)
-        if idx is None:
-            return
+        if self.planner == 'lattice':
+            path = self._lattice_planner(x, y, 
+                                       self._find_nearest_index(x, y, self.global_xy), 
+                                       self.obstacles)
+        elif self.planner == 'heuristic':
+            # ① 전역 경로에서 현재 위치와 가장 가까운 인덱스
+            idx = self._find_nearest_index(x, y, self.global_xy)
+            if idx is None:
+                return
 
-        # ② 장애물 기준 회피 방향 (연속적인 side 값: -1.0 ~ +1.0)
-        side = self._decide_side(self.obstacles)
+            # ② 장애물 기준 회피 방향 (연속적인 side 값: -1.0 ~ +1.0)
+            side = self._decide_side(self.obstacles)
 
-        # ③ path 메시지 준비 (map 좌표계 기준)
+            # ③ path 메시지 준비 (map 좌표계 기준)
+            path = Path()
+            path.header.stamp = self.get_clock().now().to_msg()
+            path.header.frame_id = "map"
+
+            # ④ local path 생성
+            s = 0.0
+            prev_px, prev_py = x, y
+            i = idx
+
+            n = len(self.global_xy)
+
+            while i < n and s <= self.L:
+                gx, gy = self.global_xy[i]
+
+                # 현재 점까지의 누적 거리
+                seg = math.hypot(gx - prev_px, gy - prev_py)
+                s += seg
+                prev_px, prev_py = gx, gy
+
+                px, py = gx, gy
+
+                if side != 0.0:
+                    # ---- ④-1. Bezier 기반 offset 프로파일 ----
+                    # t: 0 ~ 1, 3t(1-t) : 가운데에서 부드럽게 최대
+                    t = min(max(s / self.L, 0.0), 1.0)
+                    bezier = 3.0 * t * (1.0 - t)  # 0~0.75 범위
+                    offset = self.max_offset * bezier * side  # side까지 포함 (연속값)
+
+                    # ---- ④-2. 각 점에서의 local yaw ----
+                    if i + 1 < n:
+                        gx2, gy2 = self.global_xy[i + 1]
+                    else:
+                        gx2, gy2 = gx, gy
+
+                    yaw_i = math.atan2(gy2 - gy, gx2 - gx)
+
+                    # tangent 기준 법선벡터(nx, ny) : 왼쪽(+y)이 +방향
+                    nx = -math.sin(yaw_i)
+                    ny =  math.cos(yaw_i)
+
+                    px += offset * nx
+                    py += offset * ny
+
+                ps = PoseStamped()
+                ps.header = path.header
+                ps.pose.position.x = float(px)
+                ps.pose.position.y = float(py)
+                ps.pose.position.z = 0.0
+                path.poses.append(ps)
+
+                i += 1
+        
+        self.pub_local.publish(path)
+    
+    def _lattice_planner(self, x, y, idx, obs_xy):
+        """여러 후보 경로 생성 및 최적 경로 선택"""
+        candidates = []
+        
+        # 1. 각 offset으로 후보 경로 생성
+        for offset in self.lateral_offsets:
+            path = self._generate_path_with_offset(x, y, idx, offset)
+            cost = self._calculate_cost(path, obs_xy, offset)
+            candidates.append((cost, path))
+        
+        # 2. Cost 최소 경로 선택
+        candidates.sort(key=lambda c: c[0])
+        best_cost, best_path = candidates[0]
+        
+        self.get_logger().info(f"Best path cost: {best_cost:.2f}, offset: {self.lateral_offsets[candidates.index((best_cost, best_path))]}")
+        
+        return best_path
+    
+    def _generate_path_with_offset(self, x, y, idx, lateral_offset):
+        """특정 offset으로 경로 생성"""
         path = Path()
         path.header.stamp = self.get_clock().now().to_msg()
         path.header.frame_id = "map"
-
-        # ④ local path 생성
+        
         s = 0.0
         prev_px, prev_py = x, y
         i = idx
-
         n = len(self.global_xy)
-
+        
         while i < n and s <= self.L:
             gx, gy = self.global_xy[i]
-
-            # 현재 점까지의 누적 거리
             seg = math.hypot(gx - prev_px, gy - prev_py)
             s += seg
             prev_px, prev_py = gx, gy
-
-            px, py = gx, gy
-
-            if side != 0.0:
-                # ---- ④-1. Bezier 기반 offset 프로파일 ----
-                # t: 0 ~ 1, 3t(1-t) : 가운데에서 부드럽게 최대
-                t = min(max(s / self.L, 0.0), 1.0)
-                bezier = 3.0 * t * (1.0 - t)  # 0~0.75 범위
-                offset = self.max_offset * bezier * side  # side까지 포함 (연속값)
-
-                # ---- ④-2. 각 점에서의 local yaw ----
-                if i + 1 < n:
-                    gx2, gy2 = self.global_xy[i + 1]
-                else:
-                    gx2, gy2 = gx, gy
-
-                yaw_i = math.atan2(gy2 - gy, gx2 - gx)
-
-                # tangent 기준 법선벡터(nx, ny) : 왼쪽(+y)이 +방향
-                nx = -math.sin(yaw_i)
-                ny =  math.cos(yaw_i)
-
-                px += offset * nx
-                py += offset * ny
-
+            
+            # Bezier 프로파일 적용
+            t = min(max(s / self.L, 0.0), 1.0)
+            bezier = 3.0 * t * (1.0 - t)
+            offset = lateral_offset * bezier
+            
+            # Local yaw 계산
+            if i + 1 < n:
+                gx2, gy2 = self.global_xy[i + 1]
+            else:
+                gx2, gy2 = gx, gy
+            yaw_i = math.atan2(gy2 - gy, gx2 - gx)
+            
+            # 법선 방향 offset
+            nx = -math.sin(yaw_i)
+            ny = math.cos(yaw_i)
+            px = gx + offset * nx
+            py = gy + offset * ny
+            
             ps = PoseStamped()
             ps.header = path.header
             ps.pose.position.x = float(px)
             ps.pose.position.y = float(py)
-            ps.pose.position.z = 0.0
             path.poses.append(ps)
-
+            
             i += 1
+        
+        return path
+    
+    def _calculate_cost(self, path, obs_xy, offset):
+        """경로 Cost 계산"""
+        cost = 0.0
+        
+        # 1. 장애물 회피 Cost
+        obstacle_cost = self._obstacle_cost(path, obs_xy)
+        
+        # 2. 경로 이탈 Cost (offset이 클수록 불이익)
+        deviation_cost = abs(offset) * 5.0
+        
+        # 3. 부드러움 Cost (급격한 변화 불이익)
+        smoothness_cost = self._smoothness_cost(path)
+        
+        # 가중치 적용
+        cost = (
+            obstacle_cost * 10.0 +     # 장애물 회피 최우선
+            deviation_cost * 2.0 +     # 경로 이탈 페널티
+            smoothness_cost * 1.0      # 부드러움
+        )
+        
+        return cost
+    
+    def _obstacle_cost(self, path, obs_xy):
+        """장애물 근접 Cost"""
+        if not obs_xy:
+            return 0.0
+        
+        cost = 0.0
+        for pose in path.poses:
+            px, py = pose.pose.position.x, pose.pose.position.y
+            
+            for ox, oy in obs_xy:
+                # 차량 좌표 → 맵 좌표 변환 필요 (간단히 근사)
+                dist = math.hypot(px - ox, py - oy)
+                
+                if dist < 0.5:  # 충돌 위험
+                    cost += 100.0
+                elif dist < 2.0:  # 근접
+                    cost += 50.0 / dist
+                elif dist < 5.0:  # 경계
+                    cost += 10.0 / dist
+        
+        return cost
+    
+    def _smoothness_cost(self, path):
+        """경로 부드러움 Cost (곡률 기반)"""
+        if len(path.poses) < 3:
+            return 0.0
+        
+        cost = 0.0
+        for i in range(1, len(path.poses) - 1):
+            p0 = path.poses[i - 1].pose.position
+            p1 = path.poses[i].pose.position
+            p2 = path.poses[i + 1].pose.position
+            
+            # 각도 변화량 계산
+            dx1 = p1.x - p0.x
+            dy1 = p1.y - p0.y
+            dx2 = p2.x - p1.x
+            dy2 = p2.y - p1.y
+            
+            angle1 = math.atan2(dy1, dx1)
+            angle2 = math.atan2(dy2, dx2)
+            angle_diff = abs(angle2 - angle1)
+            
+            # 각도 변화가 클수록 Cost 증가
+            cost += angle_diff ** 2
+        
+        return cost
 
-        self.pub_local.publish(path)
     def _compute_local_yaw(self, pts):
         yaws = []
         for i in range(len(pts)-1):
@@ -253,9 +401,16 @@ class LocalPathAvoid(Node):
 
         return side
 
-def main(args=None, path_num: int = 1):
+def main(args=None, cargs=None):
     rclpy.init(args=args)
-    node = LocalPathAvoid(path_num=path_num)
+    node = LocalPathAvoid(path_num=cargs.path_num, 
+                          L=cargs.L, 
+                          ds=cargs.ds, 
+                          safe_lat=cargs.safe_lat, 
+                          max_offset=cargs.max_offset, 
+                          num_lattices=cargs.num_lattices, 
+                          lateral_offsets=cargs.lateral_offsets,
+                          planner=cargs.planner)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -271,5 +426,8 @@ if __name__ == "__main__":
     parser.add_argument('--ds', type=float, default=0.5, help='Distance step in meters')
     parser.add_argument('--safe_lat', type=float, default=1.0, help='Safe lateral distance in meters')
     parser.add_argument('--max_offset', type=float, default=3.5, help='Maximum lateral offset in meters')
+    parser.add_argument('--num_lattices', type=int, default=7, help='Number of lattice paths')
+    parser.add_argument('--lateral_offsets', type=float, nargs='+', default=[-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0], help='Lateral offsets for lattice paths')
+    parser.add_argument('--planner', type=str, default='lattice', choices=['lattice', 'heuristic'])
     args = parser.parse_args()
-    main(path_num=args.path_num, L=args.L, ds=args.ds, safe_lat=args.safe_lat, max_offset=args.max_offset)
+    main(cargs=args)
