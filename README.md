@@ -13,3 +13,26 @@ source ~/.bashrc
 
 bash carla_init.sh
 ```
+
+## Usage
+```
+# CARLA 실행
+bash carla/CarlaUE4.sh
+
+# 맵/날씨 변경
+python3 carla_setup.py
+
+# rviz 실행
+rviz2
+
+# 자율 주행 세팅
+python3 koo.py # Spawn Vehicle
+
+python3 ros2_lidar_clustering.py # Perception
+
+python3 cfusion.py # Perception
+
+python3 koo_local_planner.py # Planning
+
+python3 koo_controller.py # Control
+```
