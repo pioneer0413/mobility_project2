@@ -8,13 +8,17 @@ import os
 import sys
 import time
 import json
+import argparse
+import math
 import csv
 from std_msgs.msg import String
-from sensor_msgs.msg import Image, PointCloud2
+from sensor_msgs.msg import Image, PointCloud2, Imu
 from cv_bridge import CvBridge
 from ultralytics import YOLO
 
-
+# -----------------------------
+# LiDAR → NumPy 변환
+# -----------------------------
 def pointcloud2_to_array(cloud_msg):
     cloud_arr = np.frombuffer(cloud_msg.data, dtype=np.float32)
     num_points = cloud_msg.width * cloud_msg.height
@@ -22,82 +26,96 @@ def pointcloud2_to_array(cloud_msg):
     return arr[:, :3]
 
 
+# ==========================================================
+# Sensor Fusion Node
+# ==========================================================
 class SensorFusionNode(Node):
     def __init__(self):
         super().__init__('sensor_fusion_node')
 
         print("=== [Fusion + Performance Logging Enabled] ===")
 
-        # ------------------------------------------------------------------
-        # ✔ 로그 디렉토리 및 파일 초기화
-        # ------------------------------------------------------------------
-        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-        os.makedirs(log_dir, exist_ok=True)
+        # -----------------------------------------------------
+        # 1) 성능지표 로그 파일 초기화
+        # -----------------------------------------------------
+        self.log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "fusion_perf_log.csv")
 
-        self.log_perf = os.path.join(log_dir, "fusion_perf_log.csv")
-        self.log_det = os.path.join(log_dir, "detection_log.csv")
-
-        # 성능 로그 파일 생성
-        if not os.path.exists(self.log_perf):
-            with open(self.log_perf, "w") as f:
+        if not os.path.exists(self.log_path):
+            with open(self.log_path, "w", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow([
-                    "timestamp", "fps", "latency_ms",
-                    "num_vehicle", "num_traffic",
-                    "min_vehicle_dist", "min_traffic_dist"
-                ])
+                writer.writerow(["timestamp", "fps", "latency_ms", "tracking_stability"])
 
-        # Detection 로그 파일 생성
-        if not os.path.exists(self.log_det):
-            with open(self.log_det, "w") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    "timestamp", "type", "cls", "track_id",
-                    "conf", "bbox_w", "bbox_h", "bbox_area",
-                    "depth", "angle"
-                ])
+        # FPS 계산용
+        self.prev_frame_time = time.time()
 
-        self.prev_time = time.time()
+        # Tracking stability 계산용
+        self.prev_track_ids = set()
 
-        # ------------------------------------------------------------------
-        # YOLO 모델 로드
-        # ------------------------------------------------------------------
+        # -----------------------------------------------------
+        # 모델 로드
+        # -----------------------------------------------------
         current_dir = os.path.dirname(os.path.abspath(__file__))
         path_m = os.path.join(current_dir, "model", "m.pt")
         path_original = os.path.join(current_dir, "model", "original.pt")
 
         try:
             self.model_vehicle = YOLO(path_m, task='detect')
-            self.classes_vehicle = [0, 1, 2, 3, 4, 5, 6]
+            self.classes_vehicle = [0,1,2,3,4,5,6]
 
             self.model_traffic = YOLO(path_original, task='detect')
-            self.classes_traffic = [3, 4, 5]
+            self.classes_traffic = [3,4,5]
+            print(">> YOLO 모델 로딩 성공")
 
-            print(">> 모델 로딩 완료")
         except Exception as e:
-            print(f"[오류] 모델 로딩 실패: {e}")
+            print(f"[모델 로딩 실패] {e}")
             sys.exit(1)
 
         self.bridge = CvBridge()
+
         self.decision_pub = self.create_publisher(String, "/fusion/decision", 10)
-        self.result_pub = self.create_publisher(Image, "/fusion/result", 10)
+        self.result_pub   = self.create_publisher(Image, "/fusion/result", 10)
 
         qos_profile = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
-        self.sub_img = self.create_subscription(Image, "/carla/hero/camera_front/image_color", self.image_callback, qos_profile)
-        self.sub_view = self.create_subscription(Image, "/carla/hero/camera_view/image_color", self.view_callback, qos_profile)
-        self.sub_lidar = self.create_subscription(PointCloud2, "/carla/hero/lidar/point_cloud", self.lidar_callback, qos_profile)
 
+        # -----------------------------------------------------
+        # ROS 구독 설정
+        # -----------------------------------------------------
+        self.sub_img = self.create_subscription(
+            Image, "/carla/hero/camera_front/image_color",
+            self.image_callback, qos_profile)
+
+        self.sub_view = self.create_subscription(
+            Image, "/carla/hero/camera_view/image_color",
+            self.view_callback, qos_profile)
+
+        self.sub_lidar = self.create_subscription(
+            PointCloud2, "/carla/hero/lidar/point_cloud",
+            self.lidar_callback, qos_profile)
+
+        self.sub_imu = self.create_subscription(
+            Imu, "/carla/hero/imu", self.imu_callback, 10)
+
+        # -----------------------------------------------------
+        # 상태 변수
+        # -----------------------------------------------------
         self.latest_img = None
         self.latest_view = None
         self.latest_lidar = None
-        self.memory_buffer = {}
 
-        # LiDAR → Camera 변환
-        self.R_lidar2cam = np.array([[0, -1, 0], [0, 0, -1], [1, 0, 0]])
-        self.T_lidar2cam = np.array([0, -0.7, -1.6])
+        # LiDAR → Camera 변환 행렬
+        self.R_lidar2cam = np.array([[0,-1,0],[0,0,-1],[1,0,0]])
+        self.T_lidar2cam = np.array([0,-0.7,-1.6])
 
         self.K = None
+
         self.timer = self.create_timer(0.05, self.fusion_loop)
+
+        # IMU 상태
+        self.current_yaw = 0.0
+        self.yaw_rate = 0.0
+        self.lateral_accel = 0.0
+        self.forward_accel = 0.0
 
     # ----------------------------------------------------------------------
     # 카메라 콜백
@@ -107,169 +125,194 @@ class SensorFusionNode(Node):
         if self.K is None:
             w, h = msg.width, msg.height
             fov = 110.0
-            f = w / (2.0 * np.tan(np.deg2rad(fov / 2.0)))
-            self.K = np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]])
+            f = w / (2 * np.tan(np.deg2rad(fov/2)))
+            self.K = np.array([[f,0,w/2],[0,f,h/2],[0,0,1]])
 
-    def view_callback(self, msg):
-        self.latest_view = msg
+    def view_callback(self, msg): self.latest_view = msg
+    def lidar_callback(self, msg): self.latest_lidar = msg
 
-    def lidar_callback(self, msg):
-        self.latest_lidar = msg
+    # IMU 콜백
+    def imu_callback(self, msg):
+        x, y, z, w = msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w
 
-    # ----------------------------------------------------------------------
-    # ✔ Detection 단위 성능 로그 저장 함수
-    # ----------------------------------------------------------------------
-    def write_detection_log(self, info):
-        with open(self.log_det, "a") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                time.time(),
-                info["type"],
-                info["cls"],
-                info["track_id"],
-                info["conf"],
-                info["bbox_w"], info["bbox_h"], info["bbox_area"],
-                info["depth"], info["angle"]
-            ])
+        siny_cosp = 2*(w*z + x*y)
+        cosy_cosp = 1 - 2*(y*y + z*z)
+        self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
+
+        self.yaw_rate = msg.angular_velocity.z
+        self.forward_accel = msg.linear_acceleration.x
+        self.lateral_accel = msg.linear_acceleration.y
 
     # ----------------------------------------------------------------------
-    # ✔ Frame-level 성능 로그 저장 함수
-    # ----------------------------------------------------------------------
-    def write_perf_log(self, fps, latency_ms, v_count, t_count, min_v, min_t):
-        with open(self.log_perf, "a") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                time.time(), fps, latency_ms,
-                v_count, t_count, min_v, min_t
-            ])
-
-    # ----------------------------------------------------------------------
-    # YOLO + LiDAR Fusion 처리
+    # 탐지 함수
     # ----------------------------------------------------------------------
     def process_detection(self, cv_img, model, classes, lidar_points, prefix, detect_traffic=False):
+
         if lidar_points is None or self.K is None:
             return [], cv_img
 
-        # LiDAR → Camera Projection
+        # LiDAR Projection
         p_cam = np.dot(lidar_points, self.R_lidar2cam.T) + self.T_lidar2cam
-        valid = (p_cam[:, 2] > 0.5) & (p_cam[:, 2] < 100)
+        valid = (p_cam[:,2] > 0.5) & (p_cam[:,2] < 80)
         p_cam = p_cam[valid]
 
         p_2d = np.dot(p_cam, self.K.T)
-        p_2d[:, 0] /= p_2d[:, 2]
-        p_2d[:, 1] /= p_2d[:, 2]
-
-        u = p_2d[:, 0].astype(np.int32)
-        v = p_2d[:, 1].astype(np.int32)
-        d = p_cam[:, 2]
+        p_2d[:,0] /= p_2d[:,2]
+        p_2d[:,1] /= p_2d[:,2]
 
         h, w = cv_img.shape[:2]
-        in_view = (u >= 0) & (u < w) & (v >= 0) & (v < h)
-        u, v, d = u[in_view], v[in_view], d[in_view]
 
-        # YOLO inference
-        results = model.track(cv_img, persist=True, verbose=False,
-                              tracker="bytetrack.yaml",
-                              conf=0.45, classes=classes, device=0, imgsz=960)
+        u = p_2d[:,0].astype(int)
+        v = p_2d[:,1].astype(int)
+        d = p_cam[:,2]
+
+        mask = (u>=0)&(u<w)&(v>=0)&(v<h)
+        u, v, d = u[mask], v[mask], d[mask]
+
+        # YOLO Tracking
+        results = model.track(cv_img, persist=True, tracker="bytetrack.yaml",
+                              conf=0.45, classes=classes, verbose=False)
 
         detected_objects = []
-        fx = self.K[0, 0]
-        cx = self.K[0, 2]
+        fx = self.K[0,0]; cx = self.K[0,2]
 
         if results[0].boxes:
             for box in results[0].boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                x1,y1,x2,y2 = map(int, box.xyxy[0])
                 cls_id = int(box.cls[0])
-                conf = float(box.conf[0])
                 track_id = int(box.id[0]) if box.id is not None else -1
 
-                # Angle
-                box_cx = (x1 + x2) / 2
-                angle_deg = np.degrees(np.arctan((box_cx - cx) / fx))
+                box_cx = (x1+x2)/2
+                angle_deg = np.degrees(np.arctan((box_cx - cx)/fx))
 
-                # Depth estimation
-                roi_mask = (u >= x1) & (u <= x2) & (v >= y1) & (v <= y2)
-                roi_depths = d[roi_mask]
-                dist = np.min(roi_depths) if len(roi_depths) else 999
+                dist = 999
+                roi = (u>=x1)&(u<=x2)&(v>=y1)&(v<=y2)
+                depth_vals = d[roi]
+                if len(depth_vals)>0:
+                    valid_d = depth_vals[depth_vals>1.5]
+                    if len(valid_d)>0:
+                        dist = np.min(valid_d)
 
-                obj = {
-                    "type": "traffic" if detect_traffic else "vehicle",
+                detected_objects.append({
+                    "id": f"{prefix}_{track_id}",
+                    "angle": angle_deg,
+                    "dist": dist,
                     "cls": cls_id,
-                    "track_id": track_id,
-                    "conf": conf,
-                    "bbox_w": x2 - x1,
-                    "bbox_h": y2 - y1,
-                    "bbox_area": (x2 - x1) * (y2 - y1),
-                    "depth": float(dist),
-                    "angle": float(angle_deg)
-                }
-                detected_objects.append(obj)
-
-                # ✔ Detection 단위 로그 저장
-                self.write_detection_log(obj)
-
-                # Visualization
-                color = (255,100,0) if not detect_traffic else (0,255,0)
-                cv2.rectangle(cv_img, (x1,y1),(x2,y2), color, 2)
+                    "type": "traffic" if detect_traffic else "vehicle"
+                })
 
         return detected_objects, cv_img
 
     # ----------------------------------------------------------------------
-    # Fusion Loop (메인)
+    # IMU Overlay 생략 (필요 시 유지)
+    # ----------------------------------------------------------------------
+
+    # ----------------------------------------------------------------------
+    # 메인 Fusion Loop
     # ----------------------------------------------------------------------
     def fusion_loop(self):
-        loop_start = time.time()
-
-        if self.latest_view is not None:
-            try:
-                cv_view = self.bridge.imgmsg_to_cv2(self.latest_view, "bgr8")
-                cv2.imshow("Spectator View", cv_view)
-            except:
-                pass
-
         if self.latest_img is None or self.latest_lidar is None or self.K is None:
             return
+
+        start_time = time.time()   # ⏱ Latency 측정 시작
+
+        # FPS 계산
+        now = time.time()
+        fps = 1.0 / (now - self.prev_frame_time)
+        self.prev_frame_time = now
 
         frame = self.bridge.imgmsg_to_cv2(self.latest_img, "bgr8")
         lidar_pts = pointcloud2_to_array(self.latest_lidar)
 
-        # --- Detection ---
-        cars, frame = self.process_detection(frame, self.model_vehicle, self.classes_vehicle, lidar_pts, "car", False)
-        lights, frame = self.process_detection(frame, self.model_traffic, self.classes_traffic, lidar_pts, "light", True)
+        # 탐지 수행
+        objs_light, frame = self.process_detection(
+            frame, self.model_traffic, self.classes_traffic, lidar_pts, "light", True)
 
-        # 프레임 성능 지표 계산
-        v_count = len(cars)
-        t_count = len(lights)
-        min_vehicle_dist = min([c["depth"] for c in cars], default=999)
-        min_light_dist = min([l["depth"] for l in lights], default=999)
+        objs_car, frame = self.process_detection(
+            frame, self.model_vehicle, self.classes_vehicle, lidar_pts, "car", False)
 
-        # FPS/Latency 계산
-        now = time.time()
-        latency_ms = (now - loop_start) * 1000
-        fps = 1.0 / (now - self.prev_time)
-        self.prev_time = now
+        all_objects = objs_light + objs_car
 
-        # ✔ Frame-level 성능 로그 저장
-        self.write_perf_log(fps, latency_ms, v_count, t_count, min_vehicle_dist, min_light_dist)
+        # -----------------------------
+        # Tracking Stability 계산
+        # -----------------------------
+        curr_ids = {obj["id"] for obj in all_objects}
+        if len(self.prev_track_ids) > 0:
+            tracking_stability = len(curr_ids & self.prev_track_ids) / len(self.prev_track_ids)
+        else:
+            tracking_stability = 1.0
 
-        # Visualization
-        cv2.imshow("Detection Result", frame)
-        cv2.waitKey(1)
+        self.prev_track_ids = curr_ids
 
-        msg_out = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
-        self.result_pub.publish(msg_out)
+        # -----------------------------
+        # Latency 계산
+        # -----------------------------
+        latency_ms = (time.time() - start_time) * 1000
+
+        # -----------------------------
+        # 성능 로그 저장
+        # -----------------------------
+        with open(self.log_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                time.time(),
+                fps,
+                latency_ms,
+                tracking_stability
+            ])
+
+        # -----------------------------
+        # 인지 결과를 판단 노드로 전달
+        # -----------------------------
+        min_light = 999
+        light_state = "none"
+        min_car = 999
+        car_angle = 0
+
+        for obj in all_objects:
+            if obj["dist"] < 999:
+                if obj["type"] == "traffic":
+                    if obj["cls"] == 4: status = "traffic_red"
+                    elif obj["cls"] == 5: status = "traffic_yellow"
+                    else: status = "traffic_green"
+
+                    if obj["dist"] < min_light:
+                        min_light = obj["dist"]
+                        light_state = status
+
+                elif obj["type"] == "vehicle":
+                    if obj["dist"] < min_car:
+                        min_car = obj["dist"]
+                        car_angle = obj["angle"]
+
+        msg_data = {
+            "light": light_state,
+            "light_dist": min_light if min_light < 999 else -1.0,
+            "vehicle_dist": min_car if min_car < 999 else -1.0,
+            "vehicle_angle": car_angle
+        }
+
+        self.decision_pub.publish(String(data=json.dumps(msg_data)))
+
+        # 출력 화면 표시
+        out_msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
+        self.result_pub.publish(out_msg)
 
 
+# ================================================================
+# MAIN
+# ================================================================
 def main(args=None):
     rclpy.init(args=args)
     node = SensorFusionNode()
     try:
         rclpy.spin(node)
+    except:
+        pass
     finally:
         node.destroy_node()
         rclpy.shutdown()
         cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
     main()
