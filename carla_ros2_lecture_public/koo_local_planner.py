@@ -19,9 +19,6 @@ class KooLocalPlanner(Node):
         
         self.path_num = path_num
 
-        # =========================================================
-        # 1. GNSS 구독 설정 (Bridge와 호환 - 복잡한 QoS)
-        # =========================================================
         gnss_qos_profile = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL, 
@@ -31,11 +28,6 @@ class KooLocalPlanner(Node):
         self.sub_gnss = self.create_subscription(
             NavSatFix, "/carla/hero/gnss", self.gnss_cb, gnss_qos_profile)
 
-        # =========================================================
-        # 2. 장애물 구독 설정 (Lidar와 호환 - 단순 QoS 10)
-        # =========================================================
-        # lidar_clustering.py가 QoS 1(Reliable)로 보내므로 
-        # 여기서는 10(Reliable)으로 받으면 연결됨.
         self.sub_obs = self.create_subscription(
             PoseArray, "/carla/obstacles_2d", self.obs_cb, 10)
 
@@ -67,45 +59,38 @@ class KooLocalPlanner(Node):
         self.max_offset = 3.0    
         self.prev_idx = 0        
 
-        # 대기 로직 변수
-        self.obs_start_time = None
-        self.wait_time = 5.0
+        # [NEW] 스마트 대기 로직 변수
+        self.obs_start_time = None      # 최초 감지 시간
+        self.last_seen_time = None      # 마지막으로 감지된 시간
+        
+        # [수정됨] 5.0초 -> 3.0초로 변경
+        self.wait_time = 3.0            
+        
+        self.reset_timeout = 2.0        # 깜빡임 방지 시간
 
         self.load_global_path()
-
         self.timer = self.create_timer(0.1, self.timer_cb)
-        self.get_logger().info(f">> Koo Planner (Path: {self.path_num}) Started")
+        self.get_logger().info(f">> Koo Planner (Path: {self.path_num}) Wait time set to 3.0s")
 
     def load_global_path(self):
         current_dir = os.path.dirname(os.path.abspath(__file__))
         filename = f"../path/global_path_{self.path_num}.csv"
         file_path = os.path.join(current_dir, filename)
-
-        if not os.path.exists(file_path):
-            self.get_logger().warn(f"Path file not found: {file_path}")
-            return
+        if not os.path.exists(file_path): return
         try:
             with open(file_path, "r") as f:
                 for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"): continue
-                    parts = line.split(",")
-                    if len(parts) < 2: continue
-                    try:
-                        x = float(parts[0])
-                        y = float(parts[1])
-                        self.global_xy.append((x, y))
-                    except ValueError: continue
-            self.get_logger().info(f"Loaded {len(self.global_xy)} points from {filename}")
-        except Exception as e: pass
+                    parts = line.split(',')
+                    if len(parts) < 2 or line.startswith("#"): continue
+                    try: self.global_xy.append((float(parts[0]), float(parts[1])))
+                    except: continue
+            self.get_logger().info(f"Loaded {len(self.global_xy)} points")
+        except: pass
 
-    def gnss_cb(self, msg: NavSatFix):
-        lat = msg.latitude
-        lon = msg.longitude
+    def gnss_cb(self, msg):
         if self.lat0 is None:
-            self.lat0 = lat
-            self.lon0 = lon
-            self.cos_lat0 = math.cos(math.radians(lat))
+            self.lat0 = msg.latitude; self.lon0 = msg.longitude
+            self.cos_lat0 = math.cos(math.radians(msg.latitude))
             self.current_xy = (0.0, 0.0)
             self.prev_xy = (0.0, 0.0)  # ⭐ 초기화
         else:
@@ -126,37 +111,51 @@ class KooLocalPlanner(Node):
             
             self.current_xy = new_xy
 
-    def obs_cb(self, msg: PoseArray):
-        self.obstacles = [(p.position.x, p.position.y) for p in msg.poses]
+    def obs_cb(self, msg): self.obstacles = [(p.position.x, p.position.y) for p in msg.poses]
 
     def timer_cb(self):
-        if self.current_xy is None or len(self.global_xy) < 2:
-            return
-
+        if self.current_xy is None or len(self.global_xy) < 2: return
         x, y = self.current_xy
         idx = self.find_nearest_index(x, y)
         if idx is None: return
 
+        # 1. 장애물 감지 여부 확인 (Debouncing 적용)
         raw_side = self.decide_side(self.obstacles)
-        final_side = 0.0
-
-        # 5초 대기 로직
+        now = self.get_clock().now()
+        is_obstacle_present = False
+        
         if raw_side != 0.0:
+            self.last_seen_time = now
             if self.obs_start_time is None:
-                self.obs_start_time = self.get_clock().now()
-            
-            elapsed = (self.get_clock().now() - self.obs_start_time).nanoseconds / 1e9
+                self.obs_start_time = now
+            is_obstacle_present = True
+        else:
+            if self.last_seen_time is not None:
+                time_since_lost = (now - self.last_seen_time).nanoseconds / 1e9
+                if time_since_lost < self.reset_timeout:
+                    is_obstacle_present = True
+                else:
+                    self.obs_start_time = None
+                    self.last_seen_time = None
+                    is_obstacle_present = False
+
+        # 2. 회피 결정 (3초 대기)
+        final_side = 0.0
+        if is_obstacle_present and self.obs_start_time is not None:
+            elapsed = (now - self.obs_start_time).nanoseconds / 1e9
             
             if elapsed < self.wait_time:
+                # 3초 미만: 대기 (직진 -> ACC 정지 유도)
                 final_side = 0.0
                 if int(elapsed * 10) % 10 == 0:
-                    self.get_logger().info(f"🛑 Waiting... {elapsed:.1f}s")
+                    self.get_logger().info(f"🛑 Waiting... {elapsed:.1f}s / {self.wait_time:.1f}s")
             else:
-                final_side = raw_side
-                self.get_logger().info(f"⚠️ Avoidance Active!")
-        else:
-            self.obs_start_time = None
-            final_side = 0.0
+                # 3초 경과: 회피 시작
+                if raw_side != 0.0:
+                    final_side = raw_side
+                    self.get_logger().info(f"⚠️ Avoidance Active! (Side: {final_side})")
+                else:
+                    final_side = 0.0 
 
         path = Path()
         path.header.stamp = self.get_clock().now().to_msg()
@@ -178,21 +177,15 @@ class KooLocalPlanner(Node):
         while curr_idx < path_len and s <= self.L:
             gx, gy = self.global_xy[curr_idx]
             s += math.hypot(gx - prev_px, gy - prev_py)
-            prev_px, prev_py = gx, gy
-            px, py = gx, gy
+            prev_px, prev_py = gx, gy; px, py = gx, gy
 
             if final_side != 0.0:
-                t = min(max(s / self.L, 0.0), 1.0)
-                bezier = 3.0 * t * (1.0 - t)
+                t = min(max(s / self.L, 0.0), 1.0); bezier = 3.0 * t * (1.0 - t)
                 offset = self.max_offset * bezier * final_side
-
-                if curr_idx + 1 < path_len:
-                    nx, ny = self.global_xy[curr_idx+1]
-                else:
-                    nx, ny = gx, gy
+                if curr_idx + 1 < path_len: nx, ny = self.global_xy[curr_idx+1]
+                else: nx, ny = gx, gy
                 path_yaw = math.atan2(ny - gy, nx - gx)
-                px += offset * -math.sin(path_yaw)
-                py += offset * math.cos(path_yaw)
+                px += offset * -math.sin(path_yaw); py += offset * math.cos(path_yaw)
 
             # ⭐ 맵 좌표계 Path (map frame)
             ps = PoseStamped()
@@ -233,46 +226,29 @@ class KooLocalPlanner(Node):
         # self.get_logger().info(f"Vehicle Yaw: {math.degrees(self.vehicle_yaw):.1f}°, Path points: {len(path.poses)}")
 
     def find_nearest_index(self, x, y):
-        search_range = 50
-        start = max(0, self.prev_idx - search_range)
-        end = min(len(self.global_xy), self.prev_idx + search_range)
-        min_d = float('inf')
-        idx = -1
+        start = max(0, self.prev_idx - 50); end = min(len(self.global_xy), self.prev_idx + 50)
+        min_d = float('inf'); idx = -1
         for i in range(start, end):
-            gx, gy = self.global_xy[i]
-            d = (gx - x)**2 + (gy - y)**2
-            if d < min_d:
-                min_d = d
-                idx = i
-        if idx != -1:
-            self.prev_idx = idx
-            return idx
+            d = (self.global_xy[i][0] - x)**2 + (self.global_xy[i][1] - y)**2
+            if d < min_d: min_d = d; idx = i
+        if idx != -1: self.prev_idx = idx; return idx
         return self.prev_idx
 
     def decide_side(self, obs_xy) -> float:
         if not obs_xy: return 0.0
         relevant = [o for o in obs_xy if 0.1 < o[0] < self.L and abs(o[1]) < self.safe_lat]
         if not relevant: return 0.0
-
         left = sum(1.0/(o[0]*max(0.5, abs(o[1]))) for o in relevant if o[1] > 0)
         right = sum(1.0/(o[0]*max(0.5, abs(o[1]))) for o in relevant if o[1] < 0)
-
         if left == 0 and right == 0: return 0.0
         return max(-1.0, min(1.0, (right - left) / (right + left)))
 
 def main(args=None):
     rclpy.init(args=args)
     parser = argparse.ArgumentParser()
-    parser.add_argument('--path_num', type=int, default=1, help='Path number (1, 2, ...)')
-    ros_args, unknown_args = parser.parse_known_args()
-    
+    parser.add_argument('--path_num', type=int, default=1)
+    ros_args, _ = parser.parse_known_args()
     node = KooLocalPlanner(path_num=ros_args.path_num)
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    node.destroy_node()
-    rclpy.shutdown()
+    rclpy.spin(node); node.destroy_node(); rclpy.shutdown()
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
