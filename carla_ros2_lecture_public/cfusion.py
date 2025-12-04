@@ -26,7 +26,7 @@ class SensorFusionNode(Node):
     def __init__(self):
         super().__init__('sensor_fusion_node')
         
-        print("=== [Fusion Node: ROI Extended (1x Height)] ===")
+        print("=== [Fusion Node: Dual State Output] ===")
         cwd = os.getcwd()
         path_m = os.path.join(cwd, "m.pt")
         path_original = os.path.join(cwd, "original.pt")
@@ -52,7 +52,7 @@ class SensorFusionNode(Node):
         self.view_sub = self.create_subscription(
             Image, "/carla/hero/camera_view/image_color", self.view_callback, qos_profile)
         self.lidar_sub = self.create_subscription(
-            PointCloud2, "/carla/hero/lidar", self.lidar_callback, qos_profile)
+            PointCloud2, "/carla/hero/lidar/point_cloud", self.lidar_callback, qos_profile)
 
         self.latest_img = None
         self.latest_view = None
@@ -71,7 +71,10 @@ class SensorFusionNode(Node):
         if self.img_width != msg.width or self.img_height != msg.height or self.K is None:
             self.img_width = msg.width
             self.img_height = msg.height
-            f = self.img_width / 2.0
+            # FOV를 20도로 설정 (koo.json과 동일하게)
+            fov_deg = 20.0
+            # 초점 거리 공식: f = width / (2 * tan(FOV / 2))
+            f = self.img_width / (2.0 * np.tan(np.deg2rad(fov_deg / 2.0)))
             cx = self.img_width / 2.0
             cy = self.img_height / 2.0
             self.K = np.array([[f, 0, cx], [0, f, cy], [0, 0,  1]])
@@ -135,12 +138,11 @@ class SensorFusionNode(Node):
                         elif cls_id == 5: traffic_status = "traffic_yellow"; color = (0, 255, 255)
                         else: traffic_status = "traffic_green"; color = (0, 255, 0)
                         
-                        # [핵심 수정] 박스 높이만큼 아래로 더 검색 (100% 확장)
                         box_height = y2 - y1
                         search_y2 = min(self.img_height, y2 + box_height)
                     else:
                         traffic_status = "vehicle"; color = (255, 165, 0)
-                        search_y2 = min(self.img_height, y2) # 차량은 확장 안 함
+                        search_y2 = min(self.img_height, y2)
 
                     search_x1, search_x2 = max(0, x1), min(self.img_width, x2)
                     search_y1 = max(0, y1)
@@ -167,12 +169,9 @@ class SensorFusionNode(Node):
                         }
                         final_dist_str = f"{current_dist:.1f}m"
                         
-                        # [시각화]
                         cv2.rectangle(cv_img, (x1, y1), (x2, y2), color, 3)
-                        
-                        # [디버깅] 확장된 검색 영역 표시 (얇은 선)
                         if model_type == "traffic":
-                            cv2.rectangle(cv_img, (x1, y2), (x2, search_y2), color, 1) 
+                             cv2.rectangle(cv_img, (x1, y2), (x2, search_y2), color, 1)
                     else:
                         if unique_track_key in self.memory_buffer:
                             last_data = self.memory_buffer[unique_track_key]
@@ -183,20 +182,41 @@ class SensorFusionNode(Node):
                     cv2.putText(cv_img, f"{label_name} {final_dist_str}", (x1, y1 - 5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-            min_dist = 999.0
-            detected_type = "none"
-            
+            # === [핵심 수정: 두 가지 상태(차량, 신호등) 각각 추출] ===
+            closest_light = "none"
+            closest_light_dist = -1.0
+            closest_vehicle_dist = -1.0
+
+            min_light_dist = 999.0
+            min_vehicle_dist = 999.0
+
             for key, data in self.memory_buffer.items():
-                if current_time - data["time"] < 0.5:
+                if current_time - data["time"] < 0.5: # 0.5초 이내 데이터만 유효
                     dist = data["dist"]
                     obj_type = data.get("type", "unknown")
-                    if dist < min_dist:
-                        min_dist = dist
-                        detected_type = obj_type
 
-            if min_dist == 999.0: min_dist = -1.0
+                    if "traffic" in obj_type:
+                        # 가장 가까운 신호등 찾기
+                        if dist < min_light_dist:
+                            min_light_dist = dist
+                            closest_light = obj_type
+                    elif obj_type == "vehicle":
+                        # 가장 가까운 차량 찾기
+                        if dist < min_vehicle_dist:
+                            min_vehicle_dist = dist
+
+            if min_light_dist < 999.0: closest_light_dist = min_light_dist
+            if min_vehicle_dist < 999.0: closest_vehicle_dist = min_vehicle_dist
+
+            # JSON 메시지에 두 정보를 모두 포함
+            msg_data = {
+                "light": closest_light, 
+                "light_dist": closest_light_dist,
+                "vehicle_dist": closest_vehicle_dist
+            }
+            
             msg = String()
-            msg.data = json.dumps({"obj": detected_type, "dist": min_dist})
+            msg.data = json.dumps(msg_data)
             self.decision_pub.publish(msg)
 
             out_msg = self.bridge.cv2_to_imgmsg(cv_img, encoding="bgr8")
