@@ -88,6 +88,8 @@ class KooLocalPlanner(Node):
         except: pass
 
     def gnss_cb(self, msg):
+        lat = msg.latitude
+        lon = msg.longitude
         if self.lat0 is None:
             self.lat0 = msg.latitude; self.lon0 = msg.longitude
             self.cos_lat0 = math.cos(math.radians(msg.latitude))

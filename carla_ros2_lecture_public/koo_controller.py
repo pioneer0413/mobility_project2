@@ -41,8 +41,8 @@ class KooController(Node):
         self.acc_speed = self.max_speed
         
         # [정지 거리 설정]
-        self.dist_stop_car = 4.0        # 앞차 정지
-        self.dist_slow_car = 20.0       # [NEW] 앞차 감속 시작 (20m)
+        self.dist_stop_car = 30.0        # 앞차 정지
+        self.dist_slow_car = 60.0       # [NEW] 앞차 감속 시작 (20m)
         
         self.dist_stop_traffic = 30.0   # 신호등 정지
         self.dist_slow_traffic = 60.0   # 신호등 감속
