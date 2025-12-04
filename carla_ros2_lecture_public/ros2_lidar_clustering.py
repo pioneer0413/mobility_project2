@@ -16,7 +16,7 @@ class LidarObstaclesSimple(Node):
         self.pub_pose = self.create_publisher(PoseArray, '/carla/obstacles_2d', 1)
         self.pub_mk   = self.create_publisher(MarkerArray, '/carla/obstacles_markers', 1)
 
-        self.X_MAX = 35.0   # 전방 m
+        self.X_MAX = 60.0   # 전방 m
         self.Y_ABS = 6.0    # 좌우 m
         self.Z_MIN, self.Z_MAX = -3.0, 3.0
         self.VOX = 0.25     # voxel 크기(m)
