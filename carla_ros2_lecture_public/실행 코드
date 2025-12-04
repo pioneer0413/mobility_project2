@@ -1,0 +1,16 @@
+
+./CarlaUE4.sh --ros2 -RenderOffScreen
+
+python3 carla_setup.py
+
+python3 koo.py --file koo.json
+
+python3 generate_traffic.py -n 5 -w 5 --hybrid --tm-port 8002
+
+python3 cfusion.py
+
+python3 ros2_lidar_clustering.py
+
+python3 koo_local_planner.py --path_num 1
+
+python3 koo_controller.py --path_num 1
