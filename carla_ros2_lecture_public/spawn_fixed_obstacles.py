@@ -34,15 +34,16 @@ def main():
     
     # 1. 차량 (Vehicle)
     target_vehicle_indices = {
-        120: (0.0, 0.0),   # 원래 위치
-        200: (5.0, 0.5)    # 앞으로 5m, 오른쪽으로 0.5m 이동
+        #120: (0.0, 0.0),   # 원래 위치
+        #200: (5.0, 0.5)    # 앞으로 5m, 오른쪽으로 0.5m 이동
+        65: (0.0, 0.0)
     }
     
     # 2. 고깔 (Cone)
     target_cone_indices = {
-        50: (0.0, 0.0),
-        51: (0.0, 1.0),    # 오른쪽으로 1m 비켜서 설치
-        52: (0.0, -1.0)    # 왼쪽으로 1m 비켜서 설치
+        #50: (0.0, 0.0),
+        #51: (0.0, 1.0),    # 오른쪽으로 1m 비켜서 설치
+        #52: (0.0, -1.0)    # 왼쪽으로 1m 비켜서 설치
     }
     
     # 3. 안전 펜스 (Barrier)
@@ -55,10 +56,11 @@ def main():
 
     # 5. 기타 장애물들 
     target_box_indices = {
-        82: (0.0, -1.0)
+        65: (0.0, 0.0),
+        # 64: (0.0, 0.0)
     }
     target_barrel_indices = {
-
+        223: (0.0, 0.0)
     }
 
     target_trash_indices = {
@@ -140,7 +142,7 @@ def main():
             
             if actor:
                 if type_name in ["Vehicle", "Cyclist"]:
-                    actor.set_autopilot(False)
+                    actor.set_autopilot(False, 8005)
                     actor.set_simulate_physics(True)
                     control = carla.VehicleControl()
                     control.hand_brake = True

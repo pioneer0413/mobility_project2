@@ -8,7 +8,7 @@ from typing import List, Tuple, Optional
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import NavSatFix
+from sensor_msgs.msg import NavSatFix, Imu
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseArray, PoseStamped
 from rclpy.time import Time
@@ -42,13 +42,25 @@ class KooLocalPlanner(Node):
         self.pub_local_path = self.create_publisher(
             Path, "/carla/path/local", 10)
 
+        self.pub_local_path_viz = self.create_publisher(
+            Path, "/carla/path/local_viz", 10)
+
         self.lat0 = None
         self.lon0 = None
         self.cos_lat0 = 1.0
 
         self.current_xy: Optional[Tuple[float, float]] = None
+        self.prev_xy: Optional[Tuple[float, float]] = None
         self.global_xy: List[Tuple[float, float]] = []   
         self.obstacles: List[Tuple[float, float]] = []   
+
+        # ⭐ 추가: 차량 Yaw 관리
+        self.vehicle_yaw = 0.0
+        self.yaw_update_threshold = 0.02  # 2cm 이상 이동 시 업데이트
+
+        # ⭐ 차량 중점 offset (GNSS가 차량 뒤쪽에 있다고 가정)
+        self.vehicle_center_offset_x = 1.0  # 차량 앞쪽으로 1.5m (차량 길이의 절반)
+        self.vehicle_center_offset_y = 0.0  # 좌우 중앙
 
         self.L = 20.0            
         self.safe_lat = 2.0      
@@ -95,10 +107,24 @@ class KooLocalPlanner(Node):
             self.lon0 = lon
             self.cos_lat0 = math.cos(math.radians(lat))
             self.current_xy = (0.0, 0.0)
+            self.prev_xy = (0.0, 0.0)  # ⭐ 초기화
         else:
             dx = (lon - self.lon0) * (111320.0 * self.cos_lat0)
             dy = (lat - self.lat0) * 110540.0
-            self.current_xy = (dx, dy)
+            new_xy = (dx, dy)
+            
+            # ⭐ Yaw 계산: 이전 위치에서 현재 위치로의 방향
+            if self.prev_xy is not None:
+                delta_x = new_xy[0] - self.prev_xy[0]
+                delta_y = new_xy[1] - self.prev_xy[1]
+                distance_moved = math.hypot(delta_x, delta_y)
+                
+                # 충분히 이동했을 때만 yaw 업데이트 (노이즈 방지)
+                if distance_moved > self.yaw_update_threshold:
+                    self.vehicle_yaw = math.atan2(delta_y, delta_x)
+                    self.prev_xy = new_xy
+            
+            self.current_xy = new_xy
 
     def obs_cb(self, msg: PoseArray):
         self.obstacles = [(p.position.x, p.position.y) for p in msg.poses]
@@ -136,10 +162,18 @@ class KooLocalPlanner(Node):
         path.header.stamp = self.get_clock().now().to_msg()
         path.header.frame_id = "map"
 
+        path_viz = Path()
+        path_viz.header.stamp = self.get_clock().now().to_msg()
+        path_viz.header.frame_id = "hero"
+
         s = 0.0
         prev_px, prev_py = self.global_xy[idx]
         curr_idx = idx
         path_len = len(self.global_xy)
+
+        # ⭐ 좌표 변환 파라미터 미리 계산 (맵 → 차량 좌표계)
+        cos_yaw = math.cos(-self.vehicle_yaw)
+        sin_yaw = math.sin(-self.vehicle_yaw)
 
         while curr_idx < path_len and s <= self.L:
             gx, gy = self.global_xy[curr_idx]
@@ -160,14 +194,43 @@ class KooLocalPlanner(Node):
                 px += offset * -math.sin(path_yaw)
                 py += offset * math.cos(path_yaw)
 
+            # ⭐ 맵 좌표계 Path (map frame)
             ps = PoseStamped()
             ps.header = path.header
             ps.pose.position.x = px
             ps.pose.position.y = py
+            ps.pose.position.z = 0.0
             path.poses.append(ps)
+
+            # ⭐ 차량 좌표계 Path (hero frame) - 차량 중점 기준
+            # 1. 차량으로부터의 상대 위치 계산 (맵 좌표계)
+            dx_map = px - x
+            dy_map = py - y
+            
+            # 2. 회전 변환 (차량 yaw 기준으로 회전)
+            px_local = dx_map * cos_yaw - dy_map * sin_yaw
+            py_local = dx_map * sin_yaw + dy_map * cos_yaw
+            
+            # 3. ⭐ 차량 중점 offset 적용
+            # GNSS 위치를 차량 중점으로 보정
+            px_centered = px_local - self.vehicle_center_offset_x
+            py_centered = py_local - self.vehicle_center_offset_y
+            
+            ps_viz = PoseStamped()
+            ps_viz.header = path_viz.header
+            ps_viz.pose.position.x = px_centered
+            ps_viz.pose.position.y = -py_centered
+            ps_viz.pose.position.z = 0.0
+            path_viz.poses.append(ps_viz)
+
             curr_idx += 1
 
+        # ⭐ 두 Path 모두 publish
         self.pub_local_path.publish(path)
+        self.pub_local_path_viz.publish(path_viz)
+        
+        # 디버깅 로그 (필요시)
+        # self.get_logger().info(f"Vehicle Yaw: {math.degrees(self.vehicle_yaw):.1f}°, Path points: {len(path.poses)}")
 
     def find_nearest_index(self, x, y):
         search_range = 50
