@@ -190,20 +190,19 @@ class SensorFusionNode(Node):
                 detected_objects.append(obj_info)
 
                 # 시각화 (enable_viz가 True일 때만)
-                if self.enable_viz:
-                    color = (0, 255, 0)
-                    label_txt = ""
-                    if detect_traffic:
-                        if cls_id == 4: color = (0, 0, 255); label_txt="Red"
-                        elif cls_id == 5: color = (0, 255, 255); label_txt="Yellow"
-                        else: label_txt="Green"
-                    else:
-                        color = (255, 100, 0); label_txt="Car"
+                color = (0, 255, 0)
+                label_txt = ""
+                if detect_traffic:
+                    if cls_id == 4: color = (0, 0, 255); label_txt="Red"
+                    elif cls_id == 5: color = (0, 255, 255); label_txt="Yellow"
+                    else: label_txt="Green"
+                else:
+                    color = (255, 100, 0); label_txt="Car"
 
-                    cv2.rectangle(cv_img, (x1, y1), (x2, y2), color, 2)
-                    if dist < 100:
-                        info = f"{dist:.1f}m {angle_deg:.0f}dg"
-                        cv2.putText(cv_img, info, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                cv2.rectangle(cv_img, (x1, y1), (x2, y2), color, 2)
+                if dist < 100:
+                    info = f"{dist:.1f}m {angle_deg:.0f}dg"
+                    cv2.putText(cv_img, info, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
         return detected_objects, cv_img
 
