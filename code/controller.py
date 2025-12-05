@@ -37,6 +37,11 @@ class KooController(Node):
         self.max_steer = 35.0       # 최대 조향각 [도]
         self.dt = 0.05              # 제어 주기 [초] (20Hz)
 
+        # [NEW] 조향 스무딩 계수 (0.0 ~ 1.0)
+        # 0.1 ~ 0.3: 매우 부드러움 (반응 느림, 흔들림 적음)
+        # 0.7 ~ 1.0: 반응 빠름 (흔들릴 수 있음)
+        self.steer_alpha = 0.2      
+
         # 2. 속도 설정 (Speed Profile)
         self.target_speed = 5.0     # 기본 주행 목표 속도 [m/s] (약 18km/h)
         self.accel_limit = 2.0      # 가속 제한 (클수록 출발이 빠름) [m/s^2]
@@ -46,7 +51,7 @@ class KooController(Node):
         # 3. 차선 유지 (Lane Keeping) 게인
         # - K_lat: 차선 중심에서 벗어난 거리(m)를 얼마나 강하게 보정할지
         # - K_ang: 차선 각도(deg)와 내 차의 틀어짐을 얼마나 강하게 보정할지
-        self.k_lat = 0.6  
+        self.k_lat = 1.0  
         self.k_ang = 1.5  
 
         # 4. 장애물 인식 범위 (Field of View)
@@ -86,12 +91,15 @@ class KooController(Node):
         self.lane_angle = 0.0
         self.last_lane_time = 0.0
         
+        # 스무딩용 이전 조향값
+        self.prev_steer = 0.0
+        
         self.log_counter = 0
         self.timer = self.create_timer(self.dt, self.control_loop)
 
         print(f"=== KooController Started (Path: {self.path_num}) ===")
         print(f">> Params Initialized. MaxSpeed: {self.target_speed}m/s")
-        print(f">> Main FOV: +/-{self.fov_main_deg} deg | Buffer: +/-{self.fov_buffer_deg} deg")
+        print(f">> Steering Alpha: {self.steer_alpha} (Smoothing ON)")
 
     def gnss_cb(self, msg):
         if self.lat0 is None:
@@ -155,7 +163,9 @@ class KooController(Node):
 
         # (A) Pure Pursuit
         if self.local_path:
-            lookahead_dist = max(3.5, self.current_speed_cmd * 1.2)
+            # [수정됨] 룩어헤드 거리 증가 (Hunting 방지): 최소 3.5 -> 6.0m
+            lookahead_dist = max(6.0, self.current_speed_cmd * 1.8)
+            
             target_pt = None
             min_diff = 1e9
             for px, py in self.local_path:
@@ -180,8 +190,6 @@ class KooController(Node):
             lane_steer_rad = self.k_lat * self.lane_offset + self.k_ang * self.lane_angle
             lane_steer_deg = math.degrees(lane_steer_rad)
             steer_deg = max(-self.max_steer, min(self.max_steer, lane_steer_deg))
-
-        steer_deg = max(-self.max_steer, min(self.max_steer, steer_deg))
 
         # === 3. 속도 제어 (Advanced Filtering) ===
         relevant_vehicle_dist = -1.0
@@ -235,6 +243,8 @@ class KooController(Node):
                  arrival_factor = max(0.0, min(1.0, arrival_factor))
             
             # Cornering Factor
+            # [수정됨] 스무딩 전의 원본 목표 각도로 계산하거나, 현재 스무딩된 값 사용 가능
+            # 여기서는 즉각적인 반응을 위해 steer_deg(목표값) 사용
             steer_ratio = abs(steer_deg) / self.max_steer
             corner_factor = 1.0 - (steer_ratio * 0.5)
 
@@ -256,9 +266,18 @@ class KooController(Node):
             self.current_speed_cmd -= min(-speed_diff, self.decel_limit * self.dt)
         self.current_speed_cmd = max(0.0, self.current_speed_cmd)
 
+        # === 5. [NEW] 조향 스무딩 적용 (Low Pass Filter) ===
+        target_steer = max(-self.max_steer, min(self.max_steer, steer_deg))
+        
+        # alpha 적용: 이전 값과 현재 목표 값을 섞음
+        smoothed_steer = (self.prev_steer * (1.0 - self.steer_alpha)) + (target_steer * self.steer_alpha)
+        
+        self.prev_steer = smoothed_steer  # 저장
+        
+        # 실제 발행
         cmd = Twist()
         cmd.linear.x = float(self.current_speed_cmd)
-        cmd.angular.z = float(steer_deg)
+        cmd.angular.z = float(smoothed_steer)
         if self.current_speed_cmd < 0.1 and self.traffic_state == STATE_STOP_WAIT:
              cmd.linear.x = 0.0; cmd.linear.y = 1.0
         self.pub_cmd.publish(cmd)
@@ -280,7 +299,7 @@ class KooController(Node):
             light_info = f"{self.light_state}"
             if self.light_dist > 0: light_info += f"({self.light_dist:.1f}m)"
 
-            print(f"[{state_str}] [{control_mode}] Spd:{self.current_speed_cmd:.1f} | Steer:{steer_deg:.1f} | "
+            print(f"[{state_str}] [{control_mode}] Spd:{self.current_speed_cmd:.1f} | Steer:{smoothed_steer:.1f} | "
                   f"Light:{light_info} | Obs:{obs_info}")
 
 def main(args=None):
