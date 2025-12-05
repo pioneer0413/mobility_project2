@@ -8,8 +8,13 @@ import os
 import sys
 import time
 import json
+<<<<<<< HEAD
+=======
+import argparse
+import math
+>>>>>>> hwkang
 from std_msgs.msg import String
-from sensor_msgs.msg import Image, PointCloud2
+from sensor_msgs.msg import Image, PointCloud2, Imu
 from cv_bridge import CvBridge
 from ultralytics import YOLO
 
@@ -61,10 +66,22 @@ class SensorFusionNode(Node):
         self.sub_lidar = self.create_subscription(
             PointCloud2, "/carla/hero/lidar/point_cloud", self.lidar_callback, qos_profile)
 
+        # IMU
+        self.sub_imu = self.create_subscription(
+            Imu, "/carla/hero/imu", self.imu_callback, 10)
+
         self.latest_img = None
         self.latest_view = None  # 3인칭 이미지 저장용
         self.latest_lidar = None
         self.memory_buffer = {} 
+
+        # IMU 데이터 저장
+        self.current_yaw = 0.0
+        self.current_pitch = 0.0
+        self.current_roll = 0.0
+        self.yaw_rate = 0.0
+        self.lateral_accel = 0.0
+        self.forward_accel = 0.0
 
         # 좌표 변환 행렬
         self.R_lidar2cam = np.array([[ 0, -1,  0], [ 0,  0, -1], [ 1,  0,  0]])
@@ -86,6 +103,32 @@ class SensorFusionNode(Node):
 
     def lidar_callback(self, msg):
         self.latest_lidar = msg
+
+    def imu_callback(self, msg: Imu):
+        """IMU 콜백: 차량 자세 및 관성 정보"""
+        # Quaternion -> Euler 각도 변환
+        x, y, z, w = msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w
+        
+        # Roll
+        sinr_cosp = 2 * (w * x + y * z)
+        cosr_cosp = 1 - 2 * (x * x + y * y)
+        self.current_roll = math.atan2(sinr_cosp, cosr_cosp)
+        
+        # Pitch
+        sinp = 2 * (w * y - z * x)
+        self.current_pitch = math.asin(max(-1.0, min(1.0, sinp)))
+        
+        # Yaw
+        siny_cosp = 2 * (w * z + x * y)
+        cosy_cosp = 1 - 2 * (y * y + z * z)
+        self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
+        
+        # 각속도
+        self.yaw_rate = msg.angular_velocity.z
+        
+        # 가속도
+        self.forward_accel = msg.linear_acceleration.x
+        self.lateral_accel = msg.linear_acceleration.y
 
     def process_detection(self, cv_img, model, classes, lidar_points, prefix, detect_traffic=False):
         if lidar_points is None or self.K is None: return [], cv_img
@@ -142,7 +185,7 @@ class SensorFusionNode(Node):
                 }
                 detected_objects.append(obj_info)
 
-                # 시각화
+                # 시각화 (enable_viz가 True일 때만)
                 color = (0, 255, 0)
                 label_txt = ""
                 if detect_traffic:
@@ -158,6 +201,51 @@ class SensorFusionNode(Node):
                     cv2.putText(cv_img, info, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
         return detected_objects, cv_img
+
+    def draw_imu_overlay(self, frame):
+        """IMU 정보를 프레임에 오버레이"""
+        h, w = frame.shape[:2]
+        
+        # 배경 패널 (반투명)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (10, h-150), (400, h-10), (0, 0, 0), -1)
+        frame = cv2.addWeighted(frame, 0.7, overlay, 0.3, 0)
+        
+        y_offset = h - 130
+        line_height = 25
+        
+        # IMU 데이터 표시
+        texts = [
+            f"Yaw: {math.degrees(self.current_yaw):>6.1f}deg",
+            f"YawRate: {self.yaw_rate:>5.2f}r/s",
+            f"Pitch: {math.degrees(self.current_pitch):>6.1f}deg",
+            f"Roll: {math.degrees(self.current_roll):>6.1f}deg",
+            f"Accel(F/L): {self.forward_accel:>4.1f}/{self.lateral_accel:>4.1f}m/s2"
+        ]
+        
+        for i, text in enumerate(texts):
+            color = (0, 255, 255)  # 기본 노란색
+            
+            # 경고 색상 변경
+            if "YawRate" in text and abs(self.yaw_rate) > 0.8:
+                color = (0, 0, 255)  # 빨간색
+            elif "Accel" in text and (abs(self.forward_accel) > 5 or abs(self.lateral_accel) > 5):
+                color = (0, 165, 255)  # 주황색
+            
+            cv2.putText(frame, text, (20, y_offset + i * line_height),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        
+        # 차량 자세 시각화 (간단한 화살표)
+        center_x, center_y = w - 100, h - 75
+        arrow_len = 50
+        
+        # Yaw 방향 화살표
+        end_x = int(center_x + arrow_len * math.cos(self.current_yaw - math.pi/2))
+        end_y = int(center_y + arrow_len * math.sin(self.current_yaw - math.pi/2))
+        cv2.arrowedLine(frame, (center_x, center_y), (end_x, end_y), (0, 255, 0), 3, tipLength=0.3)
+        cv2.circle(frame, (center_x, center_y), 5, (255, 255, 255), -1)
+        
+        return frame
 
     def fusion_loop(self):
         # 3인칭 화면 출력 (데이터가 들어오면 바로 표시)
@@ -188,6 +276,8 @@ class SensorFusionNode(Node):
                 frame, self.model_vehicle, self.classes_vehicle, 
                 lidar_pts, "car", detect_traffic=False)
             all_objects.extend(objs_car)
+
+            frame = self.draw_imu_overlay(frame)
 
             # 2. 판단 로직
             min_light_dist = 999.0
@@ -228,13 +318,13 @@ class SensorFusionNode(Node):
             }
             self.decision_pub.publish(String(data=json.dumps(msg_data)))
 
-            # 4. 결과 화면 텍스트 & 출력
-            info_txt = f"L:{closest_light} | Car:{msg_data['vehicle_dist']:.1f}m({closest_vehicle_angle:.0f}dg)"
+            info_txt = f"Li:{closest_light} | Car:{msg_data['vehicle_dist']:.1f}m({closest_vehicle_angle:.0f}dg)"
             cv2.putText(frame, info_txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-            
-            # [NEW] 인식 결과 화면 출력
-            cv2.imshow("Detection Result", frame)
-            cv2.waitKey(1)
+
+            # 4. 결과 화면 텍스트 & 출력 (시각화 모드일 때만)
+            if self.enable_viz:    
+                cv2.imshow("Detection Result", frame)
+                cv2.waitKey(1)
             
             out_msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
             self.result_pub.publish(out_msg)
