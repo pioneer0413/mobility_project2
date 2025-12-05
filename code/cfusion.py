@@ -8,11 +8,8 @@ import os
 import sys
 import time
 import json
-<<<<<<< HEAD
-=======
 import argparse
 import math
->>>>>>> hwkang
 from std_msgs.msg import String
 from sensor_msgs.msg import Image, PointCloud2, Imu
 from cv_bridge import CvBridge
