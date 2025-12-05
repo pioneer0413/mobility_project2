@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import json
+import argparse
 from std_msgs.msg import String
 from sensor_msgs.msg import Image, PointCloud2
 from cv_bridge import CvBridge
@@ -21,15 +22,21 @@ def pointcloud2_to_array(cloud_msg):
     return arr[:, :3]
 
 class SensorFusionNode(Node):
-    def __init__(self):
+    def __init__(self, enable_viz=False):
         super().__init__('sensor_fusion_node')
         
-        print("=== [Fusion with Angle Info] ===")
-        print(">> Camera: FOV 110, 1280x720")
+        # 시각화 플래그
+        self.enable_viz = enable_viz
+        
+        print("=== [Fusion with Display] ===")
+        print(">> Camera: FOV 110 (Detection) + FOV 90 (View)")
+        print(f">> Visualization: {'ENABLED' if enable_viz else 'DISABLED'}")
         
         cwd = os.getcwd()
-        path_m = os.path.join(cwd, "model/m.pt")         
-        path_original = os.path.join(cwd, "model/original.pt") 
+        # 모델 경로 설정 (경로가 다를 경우 수정 필요)
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        path_m = os.path.join(current_dir, "model", "m.pt")         
+        path_original = os.path.join(current_dir, "model", "original.pt")
 
         try:
             self.model_vehicle = YOLO(path_m, task='detect')
@@ -38,7 +45,7 @@ class SensorFusionNode(Node):
             self.classes_traffic = [3, 4, 5] 
             print(">> 모델 로딩 완료")
         except Exception as e:
-            print(f"[오류] {e}")
+            print(f"[오류] 모델 로딩 실패: {e}")
             sys.exit(1)
 
         self.bridge = CvBridge()
@@ -47,12 +54,23 @@ class SensorFusionNode(Node):
         
         qos_profile = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         
+        # [구독 1] 전방 카메라 (인식용)
         self.sub_img = self.create_subscription(
             Image, "/carla/hero/camera_front/image_color", self.image_callback, qos_profile)
+        
+        # [구독 2] 3인칭 카메라 (화면 표시용) - 시각화 모드일 때만 구독
+        if self.enable_viz:
+            self.sub_view = self.create_subscription(
+                Image, "/carla/hero/camera_view/image_color", self.view_callback, qos_profile)
+        else:
+            self.sub_view = None
+
+        # [구독 3] 라이다
         self.sub_lidar = self.create_subscription(
             PointCloud2, "/carla/hero/lidar/point_cloud", self.lidar_callback, qos_profile)
 
         self.latest_img = None
+        self.latest_view = None  # 3인칭 이미지 저장용
         self.latest_lidar = None
         self.memory_buffer = {} 
 
@@ -70,6 +88,9 @@ class SensorFusionNode(Node):
             fov = 110.0
             f = w / (2.0 * np.tan(np.deg2rad(fov / 2.0)))
             self.K = np.array([[f, 0, w/2.0], [0, f, h/2.0], [0, 0, 1]])
+
+    def view_callback(self, msg):
+        self.latest_view = msg
 
     def lidar_callback(self, msg):
         self.latest_lidar = msg
@@ -98,10 +119,7 @@ class SensorFusionNode(Node):
                               conf=0.45, classes=classes, device=0, imgsz=960)
         
         detected_objects = []
-        
-        # 카메라 파라미터 (각도 계산용)
-        fx = self.K[0, 0]
-        cx = self.K[0, 2]
+        fx = self.K[0, 0]; cx = self.K[0, 2]
 
         if results[0].boxes:
             for box in results[0].boxes:
@@ -109,12 +127,11 @@ class SensorFusionNode(Node):
                 cls_id = int(box.cls[0])
                 track_id = int(box.id[0]) if box.id is not None else -1
                 
-                # [NEW] 중심 각도(Angle) 계산
-                # 화면 중앙(cx) 기준, 객체 중심(box_cx)이 얼마나 떨어져 있나?
+                # 중심 각도 계산
                 box_cx = (x1 + x2) / 2.0
                 angle_deg = np.degrees(np.arctan((box_cx - cx) / fx))
                 
-                # ROI 거리 측정
+                # 거리 측정
                 roi_mask = (u >= x1) & (u <= x2) & (v >= y1) & (v <= y2)
                 roi_depths = d[roi_mask]
                 
@@ -128,31 +145,42 @@ class SensorFusionNode(Node):
                     "type": "traffic" if detect_traffic else "vehicle",
                     "cls": cls_id,
                     "dist": dist,
-                    "angle": angle_deg,  # 각도 정보 저장
+                    "angle": angle_deg,
                     "id": f"{prefix}_{track_id}"
                 }
                 detected_objects.append(obj_info)
 
-                # 시각화
-                color = (0, 255, 0)
-                label_txt = ""
-                if detect_traffic:
-                    if cls_id == 4: color = (0, 0, 255); label_txt="Red"
-                    elif cls_id == 5: color = (0, 255, 255); label_txt="Yellow"
-                    else: label_txt="Green"
-                else:
-                    color = (255, 100, 0); label_txt="Car"
+                # 시각화 (enable_viz가 True일 때만)
+                if self.enable_viz:
+                    color = (0, 255, 0)
+                    label_txt = ""
+                    if detect_traffic:
+                        if cls_id == 4: color = (0, 0, 255); label_txt="Red"
+                        elif cls_id == 5: color = (0, 255, 255); label_txt="Yellow"
+                        else: label_txt="Green"
+                    else:
+                        color = (255, 100, 0); label_txt="Car"
 
-                cv2.rectangle(cv_img, (x1, y1), (x2, y2), color, 2)
-                if dist < 100:
-                    # 거리와 각도 함께 표시
-                    info = f"{dist:.1f}m {angle_deg:.0f}dg"
-                    cv2.putText(cv_img, info, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                    cv2.rectangle(cv_img, (x1, y1), (x2, y2), color, 2)
+                    if dist < 100:
+                        info = f"{dist:.1f}m {angle_deg:.0f}dg"
+                        cv2.putText(cv_img, info, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
         return detected_objects, cv_img
 
     def fusion_loop(self):
-        if self.latest_img is None or self.latest_lidar is None or self.K is None: return
+        # 3인칭 화면 출력 (시각화 모드일 때만)
+        if self.enable_viz and self.latest_view is not None:
+            try:
+                cv_view = self.bridge.imgmsg_to_cv2(self.latest_view, "bgr8")
+                cv2.imshow("Spectator View", cv_view)
+            except Exception: pass
+
+        # 메인 로직 수행 조건
+        if self.latest_img is None or self.latest_lidar is None or self.K is None: 
+            if self.enable_viz:
+                cv2.waitKey(1)
+            return
 
         try:
             frame = self.bridge.imgmsg_to_cv2(self.latest_img, "bgr8")
@@ -160,7 +188,7 @@ class SensorFusionNode(Node):
             current_time = time.time()
             all_objects = []
 
-            # 1. 탐지 실행 (전체 화면)
+            # 1. 탐지 실행
             objs_light, frame = self.process_detection(
                 frame, self.model_traffic, self.classes_traffic, 
                 lidar_pts, "light", detect_traffic=True)
@@ -174,9 +202,8 @@ class SensorFusionNode(Node):
             # 2. 판단 로직
             min_light_dist = 999.0
             closest_light = "none"
-            
             min_vehicle_dist = 999.0
-            closest_vehicle_angle = 0.0  # 가장 가까운 차의 각도
+            closest_vehicle_angle = 0.0
 
             for obj in all_objects:
                 d = obj["dist"]
@@ -198,35 +225,55 @@ class SensorFusionNode(Node):
                         closest_light = status
                         
                 elif obj["type"] == "vehicle":
-                    # 가장 가까운 차량 선택
                     if d < min_vehicle_dist:
                         min_vehicle_dist = d
                         closest_vehicle_angle = obj["angle"]
 
-            # 3. 발행 (각도 정보 추가됨)
+            # 3. 발행
             msg_data = {
                 "light": closest_light,
                 "light_dist": min_light_dist if min_light_dist < 999 else -1.0,
                 "vehicle_dist": min_vehicle_dist if min_vehicle_dist < 999 else -1.0,
-                "vehicle_angle": float(closest_vehicle_angle)  # [NEW] 각도 정보
+                "vehicle_angle": float(closest_vehicle_angle)
             }
             self.decision_pub.publish(String(data=json.dumps(msg_data)))
 
-            # 4. 결과 화면
-            info_txt = f"L:{closest_light} | Car:{msg_data['vehicle_dist']:.1f}m({closest_vehicle_angle:.0f}dg)"
-            cv2.putText(frame, info_txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            # 4. 결과 화면 텍스트 & 출력 (시각화 모드일 때만)
+            if self.enable_viz:
+                info_txt = f"L:{closest_light} | Car:{msg_data['vehicle_dist']:.1f}m({closest_vehicle_angle:.0f}dg)"
+                cv2.putText(frame, info_txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                
+                # [NEW] 인식 결과 화면 출력
+                cv2.imshow("Detection Result", frame)
+                cv2.waitKey(1)
             
+            # ROS 토픽으로는 항상 발행 (다른 노드가 사용할 수 있음)
             out_msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
             self.result_pub.publish(out_msg)
 
         except Exception as e:
+            # print(f"Error: {e}")
             pass
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = SensorFusionNode()
-    try: rclpy.spin(node)
-    except: pass
-    finally: node.destroy_node(); rclpy.shutdown(); cv2.destroyAllWindows()
+    # 인자 파싱
+    parser = argparse.ArgumentParser(description='Sensor Fusion Node')
+    parser.add_argument('--viz', action='store_true', default=False,
+                       help='Enable visualization windows')
+    parsed_args, remaining = parser.parse_known_args()
+    
+    rclpy.init(args=remaining)
+    node = SensorFusionNode(enable_viz=parsed_args.viz)
+    
+    try: 
+        rclpy.spin(node)
+    except KeyboardInterrupt: 
+        pass
+    finally: 
+        node.destroy_node()
+        rclpy.shutdown()
+        if parsed_args.viz:
+            cv2.destroyAllWindows()
 
-if __name__ == '__main__': main()
+if __name__ == '__main__': 
+    main()
