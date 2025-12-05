@@ -48,14 +48,14 @@ def waypoint_to_segment_polygon(wp0: carla.Waypoint, wp1: carla.Waypoint):
     # 첫 지점
     loc0 = wp0.transform.location
     yaw0 = math.radians(wp0.transform.rotation.yaw)
-    half_w0 = wp0.lane_width * 0.5
+    half_w0 = wp0.lane_width * 0.2
     nx0 = -math.sin(yaw0)
     ny0 = math.cos(yaw0)
 
     # 두 번째 지점
     loc1 = wp1.transform.location
     yaw1 = math.radians(wp1.transform.rotation.yaw)
-    half_w1 = wp1.lane_width * 0.5
+    half_w1 = wp1.lane_width * 0.2
     nx1 = -math.sin(yaw1)
     ny1 = math.cos(yaw1)
 
@@ -155,7 +155,7 @@ def parse_args():
     p.add_argument("--port", type=int, default=2000)
     p.add_argument("--distance", type=float, default=2.0,
                    help="waypoint 간격 (m)")
-    p.add_argument("--output", type=str, default="town01_roadmap.json",
+    p.add_argument("--output", type=str, default="town01_roadmap0.2.json",
                    help="출력 JSON 파일 경로")
     return p.parse_args()
 
